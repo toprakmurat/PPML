@@ -39,14 +39,17 @@ from concrete.ml.torch.compile import compile_brevitas_qat_model
 DEFAULT_CONFIG = {
     "n_bits": 3,              # weight & activation bit-width (2-4 typical for FHE)
     "hidden_dim": 92,         # hidden-layer width
-    "epochs": 15,             # QAT training epochs
+    "epochs": 35,             # QAT training epochs (30-50 recommended for convergence)
     "batch_size": 64,         # training batch size
     "lr": 1e-3,               # learning rate
+    "weight_decay": 1e-4,     # L2 penalty to stabilize quantized weights
+    "val_ratio": 0.10,        # 90/10 train/validation split
     "train_subset": 10_000,   # use a subset to speed up the demo
     "test_subset": 500,       # smaller test set for FHE execution timing
     "fhe_samples": 5,         # number of samples for actual FHE inference
     "seed": 42,
     "data_dir": "./data",
+    "checkpoint_path": "./best_qat_model.pth",
 }
 
 # Data Loading & Preprocessing
@@ -61,12 +64,19 @@ def load_mnist(config: dict):
     rng = np.random.default_rng(config["seed"])
     train_idx = rng.choice(len(train_ds), size=config["train_subset"], replace=False)
     test_idx  = rng.choice(len(test_ds),  size=config["test_subset"],  replace=False)
-    X_train = torch.stack([train_ds[i][0] for i in train_idx])
-    y_train = torch.tensor([train_ds[i][1] for i in train_idx])
-    X_test  = torch.stack([test_ds[i][0]  for i in test_idx])
-    y_test  = torch.tensor([test_ds[i][1]  for i in test_idx])
-    print(f"  Train: {X_train.shape}  |  Test: {X_test.shape}")
-    return X_train, y_train, X_test, y_test
+    X_train_full = torch.stack([train_ds[i][0] for i in train_idx])
+    y_train_full = torch.tensor([train_ds[i][1] for i in train_idx])
+    X_test       = torch.stack([test_ds[i][0]  for i in test_idx])
+    y_test       = torch.tensor([test_ds[i][1]  for i in test_idx])
+
+    # 90/10 Validation Split
+    val_size = int(len(X_train_full) * config["val_ratio"])
+    train_size = len(X_train_full) - val_size
+    X_train, X_val = X_train_full[:train_size], X_train_full[train_size:]
+    y_train, y_val = y_train_full[:train_size], y_train_full[train_size:]
+
+    print(f"  Train: {X_train.shape}  |  Val: {X_val.shape}  |  Test: {X_test.shape}")
+    return X_train, y_train, X_val, y_val, X_test, y_test
 
 # MLP Model Definition using Brevitas
 class QATNet(nn.Module):
@@ -124,34 +134,90 @@ class QATNet(nn.Module):
         return x
 
 # Main Quantization-Aware Training Loop
-def train_qat(model: nn.Module, X_train, y_train, config: dict):
+def train_qat(model: nn.Module, X_train, y_train, X_val, y_val, config: dict):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = model.to(device)
-    dataset = TensorDataset(X_train, y_train)
-    loader  = DataLoader(dataset, batch_size=config["batch_size"], shuffle=True)
+    train_loader = DataLoader(TensorDataset(X_train, y_train), batch_size=config["batch_size"], shuffle=True)
+    val_loader   = DataLoader(TensorDataset(X_val, y_val),     batch_size=config["batch_size"], shuffle=False)
+
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=config["lr"])
-    model.train()
+    optimizer = optim.Adam(
+        model.parameters(),
+        lr=config["lr"],
+        weight_decay=config["weight_decay"],
+    )
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=config["epochs"], eta_min=1e-5
+    )
+
+    best_val_acc = -1.0
+    checkpoint_path = Path(config["checkpoint_path"])
+
     for epoch in range(1, config["epochs"] + 1):
+        # --- Training phase ---
+        model.train()
         epoch_loss = 0.0
         correct = 0
         total = 0
-        for xb, yb in loader:
+        for xb, yb in train_loader:
             xb, yb = xb.to(device), yb.to(device)
             optimizer.zero_grad()
             logits = model(xb)
             loss = criterion(logits, yb)
             loss.backward()
+
+            # Gradient Clipping (max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
             optimizer.step()
             epoch_loss += loss.item() * xb.size(0)
             correct += (logits.argmax(dim=1) == yb).sum().item()
             total += xb.size(0)
-        avg_loss = epoch_loss / total
-        acc = correct / total
+
+        train_loss = epoch_loss / total
+        train_acc = correct / total
+
+        # --- Validation phase ---
+        model.eval()
+        val_loss_sum = 0.0
+        val_correct = 0
+        val_total = 0
+        with torch.no_grad():
+            for xb, yb in val_loader:
+                xb, yb = xb.to(device), yb.to(device)
+                logits = model(xb)
+                loss = criterion(logits, yb)
+                val_loss_sum += loss.item() * xb.size(0)
+                val_correct += (logits.argmax(dim=1) == yb).sum().item()
+                val_total += xb.size(0)
+
+        val_loss = val_loss_sum / val_total
+        val_acc = val_correct / val_total
+
+        # Step Learning Rate Scheduler
+        scheduler.step()
+
+        # Save Best Checkpoint
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            torch.save(model.state_dict(), checkpoint_path)
+            saved_str = " -> Best Saved"
+        else:
+            saved_str = ""
+
+        current_lr = optimizer.param_groups[0]["lr"]
         print(f"    Epoch {epoch:>2}/{config['epochs']}  "
-              f"loss={avg_loss:.4f}  acc={acc:.4f}")
+              f"loss={train_loss:.4f} acc={train_acc:.4f} | "
+              f"val_loss={val_loss:.4f} val_acc={val_acc:.4f} | "
+              f"lr={current_lr:.1e}{saved_str}")
+
+    # Restore best checkpoint before FHE compilation
+    if checkpoint_path.exists():
+        print(f"\n  Loading best model checkpoint from {checkpoint_path} (val_acc={best_val_acc:.4f})...")
+        model.load_state_dict(torch.load(checkpoint_path, weights_only=True))
+
     model = model.cpu().eval()
-    return model
+    return model, best_val_acc
 
 # Evaluation Helpers
 def evaluate_pytorch(model, X_test, y_test):
@@ -198,7 +264,11 @@ def main():
     parser.add_argument("--hidden_dim", type=int, default=DEFAULT_CONFIG["hidden_dim"],
                         help="Hidden layer width (default: 92)")
     parser.add_argument("--epochs", type=int, default=DEFAULT_CONFIG["epochs"],
-                        help="Training epochs (default: 15)")
+                        help="Training epochs (default: 35)")
+    parser.add_argument("--weight_decay", type=float, default=DEFAULT_CONFIG["weight_decay"],
+                        help="Weight decay penalty (default: 1e-4)")
+    parser.add_argument("--val_ratio", type=float, default=DEFAULT_CONFIG["val_ratio"],
+                        help="Validation set ratio (default: 0.10)")
     parser.add_argument("--train_subset", type=int, default=DEFAULT_CONFIG["train_subset"],
                         help="Number of training samples (default: 10000)")
     parser.add_argument("--test_subset", type=int, default=DEFAULT_CONFIG["test_subset"],
@@ -213,7 +283,7 @@ def main():
     np.random.seed(config["seed"])
 
     print("\nStep 1 - Loading MNIST dataset")
-    X_train, y_train, X_test, y_test = load_mnist(config)
+    X_train, y_train, X_val, y_val, X_test, y_test = load_mnist(config)
     
     print("\nStep 2 - Building Brevitas QAT Model║")
     model = QATNet(n_bits=config["n_bits"], hidden_dim=config["hidden_dim"])
@@ -224,7 +294,7 @@ def main():
     # print(f"\n  Model structure:\n{model}")
     
     print("\nStep 3 - Quantization-Aware Training")
-    model = train_qat(model, X_train, y_train, config)
+    model, best_val_acc = train_qat(model, X_train, y_train, X_val, y_val, config)
     
     print("\nStep 4 - Compiling to FHE circuit") 
     # Calibration set is a small subset of training data
@@ -275,6 +345,7 @@ def main():
     print(f"  Accumulator:     {bitwidth} bits")
     print(f"  Compile time:    {compile_time:.1f}s")
     print(f"  PyTorch acc:     {acc_pt:.4f}")
+    print(f"  Best Val acc:    {best_val_acc:.4f}")
     print(f"  FHE sim acc:     {acc_sim:.4f}")
     if not config["skip_fhe_execute"]:
         print(f"  FHE exec acc:    {acc_fhe:.4f}")
