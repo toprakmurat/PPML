@@ -19,7 +19,13 @@ def plot_joint_allocation(json_path: str, out_img_path: str):
     with open(json_path, "r") as f:
         data = json.load(f)
 
-    results_by_mode = data["results_by_mode"]
+    if "primary_formulation_results" in data:
+        results_by_mode = data["primary_formulation_results"]
+    elif "results_by_mode" in data:
+        results_by_mode = data["results_by_mode"]
+    else:
+        raise KeyError("Could not find formulation results in JSON file.")
+
     budget_points = data["budget_points"]
     labels = list(budget_points.keys())
 

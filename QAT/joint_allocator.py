@@ -203,3 +203,57 @@ class JointKnapsackAllocator:
             res = self.solve_knapsack(max_budget=target, mode=mode)
             results.append(res)
         return results
+
+    def solve_min_cost_for_distortion(self, max_allowed_distortion: float, mode: str = "joint") -> typing.Dict[str, typing.Any]:
+        """
+        Dual Constrained Optimization:
+            min_{b_l, s_l} Total_FHE_Cost(b_l, s_l)
+            s.t.           Total_Distortion(b_l, s_l) <= max_allowed_distortion
+        Finds the lowest cost / lowest latency FHE circuit configuration that satisfies
+        a maximum allowable sensitivity-weighted distortion bound (e.g. target accuracy SLA).
+        """
+        if mode == "joint":
+            b_choices = self.bit_widths
+            s_choices = self.sparsities
+        elif mode == "bitwidth_only":
+            b_choices = self.bit_widths
+            s_choices = [0.0]
+        elif mode == "pruning_only":
+            b_choices = [3]
+            s_choices = self.sparsities
+        else:
+            raise ValueError(f"Unknown mode '{mode}'. Choose 'joint', 'bitwidth_only', or 'pruning_only'.")
+
+        grid_fc1 = [(b, s) for b in b_choices for s in s_choices]
+        grid_fc2 = [(b, s) for b in b_choices for s in s_choices]
+        grid_fc3 = [(b, s) for b in b_choices for s in s_choices]
+
+        best_eval = None
+        min_cost = float("inf")
+
+        for opt1 in grid_fc1:
+            for opt2 in grid_fc2:
+                for opt3 in grid_fc3:
+                    cfg = {"fc1": opt1, "fc2": opt2, "fc3": opt3}
+                    res = self.evaluate_configuration(cfg)
+
+                    if res["total_distortion"] <= max_allowed_distortion:
+                        if res["total_cost"] < min_cost:
+                            min_cost = res["total_cost"]
+                            best_eval = res
+
+        if best_eval is None:
+            min_dist = float("inf")
+            for opt1 in grid_fc1:
+                for opt2 in grid_fc2:
+                    for opt3 in grid_fc3:
+                        cfg = {"fc1": opt1, "fc2": opt2, "fc3": opt3}
+                        res = self.evaluate_configuration(cfg)
+                        if res["total_distortion"] < min_dist:
+                            min_dist = res["total_distortion"]
+                            best_eval = res
+
+        best_eval["mode"] = mode
+        best_eval["max_allowed_distortion"] = max_allowed_distortion
+        return best_eval
+

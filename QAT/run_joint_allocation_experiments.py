@@ -1,10 +1,14 @@
 """
 Run Phase 3 Joint Allocation Experiments
 =========================================
-Runs joint knapsack optimization across 4 total budget points for:
-  1. Joint Allocation (Bit-width + Structured Pruning)
-  2. Bit-width-Only Ablation (Baseline #2)
-  3. Pruning-Only Ablation (Baseline #3)
+Runs joint optimization across:
+  1. Primary Formulation: Minimize Distortion s.t. FHE Cost <= Budget Target
+  2. Dual Formulation:    Minimize FHE Cost s.t. Distortion <= SLA Accuracy Bound
+
+Evaluates three modes:
+  - Joint Allocation (Bit-width + Structured Pruning)
+  - Bit-width-Only Ablation (Baseline #2)
+  - Pruning-Only Ablation (Baseline #3)
 
 Verifies recommended configurations with Concrete ML and exports results to
 `QAT/joint_allocation_results.json`.
@@ -40,15 +44,6 @@ def sanitize_for_json(obj):
 
 
 def compile_custom_config_in_concrete_ml(config: dict, seed: int = 42):
-    """
-    Constructs a Brevitas QATNet matching a per-layer configuration dict:
-      config = {
-        "fc1": (b1, s1),
-        "fc2": (b2, s2),
-        "fc3": (b3, s3),
-      }
-    and compiles it via Concrete ML to extract exact circuit graph metrics.
-    """
     (b1, s1) = config["fc1"]
     (b2, s2) = config["fc2"]
     (b3, s3) = config["fc3"]
@@ -113,19 +108,17 @@ def main():
     allocator = JointKnapsackAllocator(hessian_results_path=hessian_path)
 
     # 1. Determine FHE Budget Range
-    # Evaluate max unconstrained baseline cost (b=8, s=0%)
     max_cfg = {"fc1": (8, 0.0), "fc2": (8, 0.0), "fc3": (8, 0.0)}
     max_eval = allocator.evaluate_configuration(max_cfg)
     max_cost = max_eval["total_cost"]
 
-    # Evaluate min baseline cost (b=3, s=0.75)
     min_cfg = {"fc1": (3, 0.75), "fc2": (3, 0.75), "fc3": (3, 0.75)}
     min_eval = allocator.evaluate_configuration(min_cfg)
     min_cost = min_eval["total_cost"]
 
     print(f"  [+] Calculated FHE Cost Range: Min Cost = {min_cost:,.0f} | Max Cost = {max_cost:,.0f}")
 
-    # Define 4 Budget Target Points
+    # --- Formulation 1: Fixed Budget Sweeps (Minimizing Distortion) ---
     budget_points = [
         float(round(min_cost + 0.15 * (max_cost - min_cost))),  # Budget 1: Low / Tight
         float(round(min_cost + 0.40 * (max_cost - min_cost))),  # Budget 2: Medium
@@ -134,22 +127,22 @@ def main():
     ]
     budget_labels = ["B1_Tight", "B2_Medium", "B3_High", "B4_Max"]
 
-    # 2. Run Allocation Sweeps across Modes
     modes = ["joint", "bitwidth_only", "pruning_only"]
     results_by_mode = {}
 
+    print("\n=======================================================")
+    print(" 1. Primary Formulation: Min Distortion s.t. Cost <= Budget")
+    print("=======================================================")
+
     for mode in modes:
-        print(f"\n--- Running Optimization Mode: '{mode.upper()}' ---")
+        print(f"\n--- Optimization Mode: '{mode.upper()}' ---")
         mode_results = []
         for idx, target in enumerate(budget_points):
             label = budget_labels[idx]
             res = allocator.solve_knapsack(max_budget=target, mode=mode)
-            
-            # Concrete ML Compilation Validation
             c_info = compile_custom_config_in_concrete_ml(res["config"])
             res["concrete_ml_validation"] = c_info
             res["budget_label"] = label
-            
             mode_results.append(res)
 
             cfg_str = " | ".join([f"{l}: {b}b, {int(s*100)}%s" for l, (b, s) in res["config"].items()])
@@ -157,12 +150,39 @@ def main():
 
         results_by_mode[mode] = mode_results
 
-    # 3. Format and Export Structured JSON Results
+    # --- Formulation 2: Dual Accuracy Sweeps (Minimizing FHE Cost s.t. Distortion <= Limit) ---
+    distortion_targets = [0.001, 0.010, 0.050, 0.100]
+    sla_labels = ["SLA_Strict(0.001)", "SLA_High(0.010)", "SLA_Med(0.050)", "SLA_Relaxed(0.100)"]
+    dual_results_by_mode = {}
+
+    print("\n=======================================================")
+    print(" 2. Dual Formulation: Min FHE Cost s.t. Distortion <= SLA Limit")
+    print("=======================================================")
+
+    for mode in modes:
+        print(f"\n--- Dual Mode: '{mode.upper()}' ---")
+        dual_mode_results = []
+        for idx, d_max in enumerate(distortion_targets):
+            label = sla_labels[idx]
+            res = allocator.solve_min_cost_for_distortion(max_allowed_distortion=d_max, mode=mode)
+            c_info = compile_custom_config_in_concrete_ml(res["config"])
+            res["concrete_ml_validation"] = c_info
+            res["sla_label"] = label
+            dual_mode_results.append(res)
+
+            cfg_str = " | ".join([f"{l}: {b}b, {int(s*100)}%s" for l, (b, s) in res["config"].items()])
+            print(f"  [{label:<18}] Max Dist <= {d_max:>5.3f} | Cost: {res['total_cost']:>8,.0f} | Actual Dist: {res['total_distortion']:>8.4f} | Config: {cfg_str}")
+
+        dual_results_by_mode[mode] = dual_mode_results
+
+    # Export Structured JSON Results
     payload = {
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
         "budget_points": {label: target for label, target in zip(budget_labels, budget_points)},
+        "distortion_targets": {label: d_max for label, d_max in zip(sla_labels, distortion_targets)},
         "fhe_cost_range": {"min_cost": min_cost, "max_cost": max_cost},
-        "results_by_mode": results_by_mode,
+        "primary_formulation_results": results_by_mode,
+        "dual_formulation_results": dual_results_by_mode,
     }
 
     sanitized_payload = sanitize_for_json(payload)
@@ -170,11 +190,11 @@ def main():
     with open(out_json_path, "w") as f:
         json.dump(sanitized_payload, f, indent=2)
 
-    print(f"\n[+] Results successfully exported to '{out_json_path}'")
+    print(f"\n[+] All formulation results successfully exported to '{out_json_path}'")
 
-    # 4. Print Summary Comparison Table
+    # Print Summary Tables
     print("\n╔════════════════════════════════════════════════════════════════════════════════════════╗")
-    print("║ Phase 3 Joint Allocation Summary (Distortion @ Budget Targets)                          ║")
+    print("║ Primary Summary: Distortion @ Fixed Cost Budget Target                                  ║")
     print("╠════════════════════════════════════════════════════════════════════════════════════════╣")
     print(f"║ {'Budget Target':<12} | {'Joint Distortion':<18} | {'Bit-width-Only':<18} | {'Pruning-Only':<18} ║")
     print("╠════════════════════════════════════════════════════════════════════════════════════════╣")
@@ -184,6 +204,19 @@ def main():
         d_bw = results_by_mode["bitwidth_only"][i]["total_distortion"]
         d_prune = results_by_mode["pruning_only"][i]["total_distortion"]
         print(f"║ {label:<12} | {d_joint:<18.4f} | {d_bw:<18.4f} | {d_prune:<18.4f} ║")
+    print("╚════════════════════════════════════════════════════════════════════════════════════════╝")
+
+    print("\n╔════════════════════════════════════════════════════════════════════════════════════════╗")
+    print("║ Dual Summary: Min FHE Cost @ Target Accuracy SLA (Distortion Limit)                    ║")
+    print("╠════════════════════════════════════════════════════════════════════════════════════════╣")
+    print(f"║ {'Distortion SLA':<18} | {'Joint FHE Cost':<16} | {'Bit-width-Only Cost':<18} | {'Pruning-Only Cost':<16} ║")
+    print("╠════════════════════════════════════════════════════════════════════════════════════════╣")
+    for i in range(len(distortion_targets)):
+        label = sla_labels[i]
+        c_joint = dual_results_by_mode["joint"][i]["total_cost"]
+        c_bw = dual_results_by_mode["bitwidth_only"][i]["total_cost"]
+        c_prune = dual_results_by_mode["pruning_only"][i]["total_cost"]
+        print(f"║ {label:<18} | {c_joint:<16,.0f} | {c_bw:<18,.0f} | {c_prune:<16,.0f} ║")
     print("╚════════════════════════════════════════════════════════════════════════════════════════╝\n")
 
 
