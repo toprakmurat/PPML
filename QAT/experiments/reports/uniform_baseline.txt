@@ -1,0 +1,56 @@
+Step 1 - Loading MNIST dataset
+  Train: torch.Size([10000, 784])  |  Test: torch.Size([500, 784])
+
+Step 2 - Building Brevitas QAT Model║
+  Architecture: 784 → 92 → 92 → 10
+  Bit-width:    3b weights / 3b activations
+  Parameters:   81,709
+
+Step 3 - Quantization-Aware Training
+    Epoch  1/15  loss=0.8484  acc=0.7680
+    Epoch  2/15  loss=0.3343  acc=0.9000
+    Epoch  3/15  loss=0.2563  acc=0.9236
+    Epoch  4/15  loss=0.2120  acc=0.9360
+    Epoch  5/15  loss=0.1792  acc=0.9451
+    Epoch  6/15  loss=0.1509  acc=0.9549
+    Epoch  7/15  loss=0.1277  acc=0.9626
+    Epoch  8/15  loss=0.1135  acc=0.9640
+    Epoch  9/15  loss=0.0910  acc=0.9738
+    Epoch 10/15  loss=0.0831  acc=0.9741
+    Epoch 11/15  loss=0.0689  acc=0.9792
+    Epoch 12/15  loss=0.0612  acc=0.9805
+    Epoch 13/15  loss=0.0528  acc=0.9841
+    Epoch 14/15  loss=0.0481  acc=0.9856
+    Epoch 15/15  loss=0.0355  acc=0.9905
+
+Step 4 - Compiling to FHE circuit
+  Compiling with compile_brevitas_qat_model()...
+Compilation complete in 1.3s
+  Accumulator bit-width: 10 bits
+Step 5a - PyTorch Baseline (float)
+  PyTorch accuracy:  0.9600  (480/500)
+Step 5b - FHE Simulation (cleartext integers)
+  Simulated accuracy: 0.9580  (479/500)
+  Simulation time:    10.22s for 500 samples
+
+Step 5c - FHE Execution (encrypted inference)
+
+  Running FHE inference on 5 encrypted samples...
+    Sample 1: true=4  pred=4  ✓  (33.0s)
+    Sample 2: true=3  pred=3  ✓  (19.2s)
+    Sample 3: true=6  pred=6  ✓  (15.5s)
+    Sample 4: true=5  pred=5  ✓  (15.6s)
+    Sample 5: true=4  pred=4  ✓  (15.4s)
+
+  FHE accuracy: 1.0000  (5/5)
+
+╔══════════════════════════════════════════════════╗
+║  Summary                                         ║
+╚══════════════════════════════════════════════════╝
+  Model:           QATNet (3b, H=92)
+  Parameters:      81,709
+  Accumulator:     10 bits
+  Compile time:    1.3s
+  PyTorch acc:     0.9600
+  FHE sim acc:     0.9580
+  FHE exec acc:    1.0000

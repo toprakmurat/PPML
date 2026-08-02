@@ -165,3 +165,19 @@ cython_debug/
 # Misc
 *.ipynb*
 *.sh
+
+# Generated experiment results & artifact files
+**/__pycache__/
+*.json
+*.png
+*.pth
+
+# Dataset cache files & directories
+**/data/
+**/MNIST/
+*.pt
+*.gz
+*-ubyte
+
+
+

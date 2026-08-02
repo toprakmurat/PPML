@@ -1,18 +1,18 @@
 """
-FHE Cost Model Module
-=====================
-Deliverable for Phase 1: Validated FHE Cost Estimator Function.
-
+FHE Cost Estimator Function
+============================
 Provides `estimated_cost(layer, bitwidth, sparsity)` to calculate Concrete ML
-FHE operational cost (PBS operations * unit PBS complexity 2^b_acc) based on
-layer dimensions, bit-width precision, and sparsity (fan-in pruning fraction).
+FHE operational cost based on layer dimensions, bit-width precision, and sparsity.
 """
 
 import os
 import json
 import math
-import numpy as np
+from pathlib import Path
 from typing import Union, Tuple, Dict, Any
+
+_BASE_DIR = Path(__file__).resolve().parents[2]
+_RESULTS_JSON = _BASE_DIR / "experiments" / "results" / "cost_model_results.json"
 
 DEFAULT_LAYER_DIMS = {
     "fc1": (784, 92, True),
@@ -25,7 +25,7 @@ def _load_calibration_data() -> Dict[str, Any]:
     """
     Loads empirical benchmark results if available.
     """
-    json_path = os.path.join(os.path.dirname(__file__), "cost_model_results.json")
+    json_path = str(_RESULTS_JSON)
     if os.path.exists(json_path):
         try:
             with open(json_path, "r") as f:
@@ -44,21 +44,11 @@ def estimate_accumulator_bitwidth(
 ) -> int:
     """
     Estimates maximum integer accumulator bit-width (b_acc) for a given layer.
-
-    Args:
-        in_features: Number of input features/connections.
-        bitwidth: Quantization precision bit-width (2 to 16).
-        sparsity: Fraction of zeroed weights (0.0 = dense, 0.8 = 80% sparse).
-        calib_data: Optional benchmark calibration results.
-        layer_name: Optional layer name ('fc1', 'fc2', 'fc3').
-
-    Returns:
-        Estimated accumulator bit-width b_acc (integer, typically in 2..16).
     """
     fan_in_ratio = max(0.01, 1.0 - sparsity)
     active_fan_in = max(1, int(round(in_features * fan_in_ratio)))
 
-    # Check empirical lookup table if calibration data is provided and contains successful runs
+    # Check empirical lookup table if calibration data is provided
     if calib_data and "bitwidth_results" in calib_data:
         bw_matches = [
             r for r in calib_data["bitwidth_results"]
@@ -79,11 +69,8 @@ def estimate_accumulator_bitwidth(
             return max(2, min(16, fan_matches[0]["b_acc"] + delta_b))
 
     # Analytical / calibrated fallback formula:
-    # b_acc = b_weight/act + ceil(log2(active_fan_in * average_magnitude_factor))
     magnitude_scale = 0.35
     accum_bits = bitwidth + int(math.ceil(math.log2(max(1, active_fan_in * magnitude_scale))))
-    
-    # Concrete ML bounds accumulator bit-widths to [2, 16]
     return max(2, min(16, accum_bits))
 
 
@@ -94,16 +81,7 @@ def estimated_cost(
 ) -> float:
     """
     Computes the calibrated FHE execution cost estimate for a layer.
-
-    Args:
-        layer: Layer specification ('fc1', 'fc2', 'fc3', or (in_features, out_features)).
-        bitwidth: Integer weight/activation quantization bit-width (2 to 16).
-        sparsity: Float fraction of zeroed/pruned connections [0.0, 1.0).
-
-    Returns:
-        Estimated FHE operational cost (units of PBS operation complexity, O(N_neurons * 2^b_acc)).
     """
-    # 1. Parse layer geometry
     if isinstance(layer, str):
         layer_key = layer.lower()
         if layer_key in DEFAULT_LAYER_DIMS:
@@ -121,7 +99,6 @@ def estimated_cost(
     else:
         raise TypeError(f"Unsupported layer type: {type(layer)}")
 
-    # 2. Validate bounds
     if not (2 <= bitwidth <= 16):
         raise ValueError(f"bitwidth must be between 2 and 16, got {bitwidth}")
     if not (0.0 <= sparsity < 1.0):
@@ -129,7 +106,6 @@ def estimated_cost(
 
     calib_data = _load_calibration_data()
 
-    # 3. Estimate accumulator bit-width
     b_acc = estimate_accumulator_bitwidth(
         in_features=in_features,
         bitwidth=bitwidth,
@@ -138,9 +114,6 @@ def estimated_cost(
         layer_name=layer_key if isinstance(layer, str) else None,
     )
 
-    # 4. Compute cost decomposition:
-    # layer_cost(b, s) = num_neurons * unit_pbs_cost(b_acc)
-    # unit_pbs_cost = 2^b_acc
     num_neurons = out_features
     unit_pbs_cost = 2 ** b_acc
     cost = num_neurons * unit_pbs_cost
